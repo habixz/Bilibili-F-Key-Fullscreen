@@ -328,25 +328,53 @@
         }
 
         /**
-         * 这里明确等待退出真全屏后的最终落点是“网页全屏”。
-         * 对 B 站来说，真全屏退出与 `data-screen` 更新可能不是同一拍完成，
-         * 所以仍然要做一次状态确认，避免后续把“还没完全切回来”的状态误判成普通模式。
+         * 运行时证据表明，B 站当前从真全屏退出后会直接回到普通模式，
+         * 而不是自动落到网页全屏。
+         * 因此这里不再假设“播放器会替我们补回网页全屏”，
+         * 而是先观察退出后的真实落点：
+         * 1. 如果已经是网页全屏，就直接进入“下一步该退普通”的中间态
+         * 2. 如果已经回到普通，就由脚本主动再补一次网页全屏
          */
-        const hasEnteredWebscreen = await waitFor(() => {
+        const hasReachedIntermediateState = await waitFor(() => {
             if (!isActiveSwitchToken(token, player)) {
                 return true;
             }
 
-            return isWebscreen(player);
+            return isWebscreen(player) || isNormalScreen(player);
         }, CONFIG.screenSwitchTimeout);
 
         if (!isActiveSwitchToken(token, player)) {
             return false;
         }
 
-        if (!hasEnteredWebscreen) {
+        if (!hasReachedIntermediateState) {
             console.warn('[B站F键切换网页全屏与全屏] 退出真全屏后未能稳定回到网页全屏');
             return false;
+        }
+
+        if (isNormalScreen(player)) {
+            const reenteredWebscreen = await clickPlayerButton(player, () => getWebscreenButton(player));
+            if (!reenteredWebscreen) {
+                console.warn('[B站F键切换网页全屏与全屏] 退出真全屏后已回到普通模式，但未能重新进入网页全屏');
+                return false;
+            }
+
+            const hasEnteredWebscreen = await waitFor(() => {
+                if (!isActiveSwitchToken(token, player)) {
+                    return true;
+                }
+
+                return isWebscreen(player);
+            }, CONFIG.screenSwitchTimeout);
+
+            if (!isActiveSwitchToken(token, player)) {
+                return false;
+            }
+
+            if (!hasEnteredWebscreen) {
+                console.warn('[B站F键切换网页全屏与全屏] 退出真全屏后尝试补回网页全屏超时');
+                return false;
+            }
         }
 
         state.webscreenReturnToNormal = true;
