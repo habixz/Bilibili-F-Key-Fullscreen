@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站F键切换网页全屏与全屏
 // @namespace    /DBI/bilibili-f-screen-mode-cycle
-// @version      1.1.0
-// @description  在 B 站视频页按 F 键时，按“普通 -> 网页全屏 -> 全屏 -> 网页全屏 -> 普通”的顺序循环切换，而不是只在普通与全屏之间切换。
+// @version      1.2.0
+// @description  在 B 站视频页按 F 键时，按“普通 -> 网页全屏 -> 全屏 -> 普通”的顺序循环切换，并避免在输入区打字时误触。
 // @author       SCP
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/bangumi/play/*
@@ -35,6 +35,7 @@
             'input',
             'textarea',
             'select',
+            '[role="textbox"]',
             '[contenteditable]:not([contenteditable="false"])'
         ].join(', ')
     };
@@ -43,7 +44,7 @@
      * 脚本涉及到一些异步等待：
      * 1. 唤醒控制栏后，给按钮一次重新出现的时间
      * 2. 真全屏退出后，等待浏览器和播放器状态同步
-     * 3. 真全屏退到网页全屏后，等待网页全屏状态稳定
+     * 3. 状态切换后，等待播放器稳定落到目标模式
      *
      * 这些时序都不适合写死成同步 click，所以统一抽成可调参数。
      */
@@ -57,16 +58,15 @@
      * 运行期状态：
      * 1. `switching` 用来避免用户连按 F 导致并发切换
      * 2. `switchToken` 用来在异步链路中识别“这次切换是否仍然有效”
-     * 3. `webscreenReturnToNormal` 用来区分当前网页全屏是不是“刚从真全屏退回来”的中间态
      *
-     * 之所以需要这个标记，是因为“网页全屏”现在有两种不同语义：
-     * 1. 从普通进入网页全屏时，下一步应该进真全屏
-     * 2. 从真全屏退回网页全屏时，下一步应该退到普通
+     * 当前循环已经简化成固定三态：
+     * 1. 普通 -> 网页全屏
+     * 2. 网页全屏 -> 真全屏
+     * 3. 真全屏 -> 普通
      */
     const state = {
         switching: false,
-        switchToken: 0,
-        webscreenReturnToNormal: false
+        switchToken: 0
     };
 
     /**
@@ -152,18 +152,123 @@
     }
 
     /**
-     * 判断当前按键目标是否属于不该拦截的输入区域。
-     * 这样用户在评论框、搜索框、其他输入框里输入 F 时，不会误触脚本。
+     * 把任意事件目标尽量归一化成元素节点。
+     * 某些富文本编辑器里，keydown 的 target 可能是文本节点，
+     * 如果只接受 Element，就会把“正在输入”的场景漏过去。
      *
      * @param {EventTarget|null} target
+     * @returns {Element|null}
+     */
+    function getClosestTargetElement(target) {
+        if (target instanceof Element) {
+            return target;
+        }
+
+        if (target instanceof Node) {
+            return target.parentElement;
+        }
+
+        return null;
+    }
+
+    /**
+     * 判断某个元素是否位于可编辑输入区域内。
+     * 这里统一兼容原生输入框、富文本编辑器，以及带 `role="textbox"` 的自定义输入控件。
+     *
+     * @param {Element|null} element
      * @returns {boolean}
      */
-    function shouldIgnoreShortcutTarget(target) {
-        if (!(target instanceof Element)) {
+    function isEditableElement(element) {
+        if (!(element instanceof Element)) {
             return false;
         }
 
-        return Boolean(target.closest(SELECTORS.ignoredInputs));
+        return Boolean(element.closest(SELECTORS.ignoredInputs));
+    }
+
+    /**
+     * 获取当前文档里真正处于焦点链末端的元素。
+     * 之所以不用只看 `document.activeElement`，
+     * 是因为某些自定义输入控件会把真实焦点继续放进 shadowRoot 内部。
+     *
+     * @returns {Element|null}
+     */
+    function getDeepActiveElement() {
+        let activeElement = document.activeElement instanceof Element ? document.activeElement : null;
+
+        while (activeElement && activeElement.shadowRoot && activeElement.shadowRoot.activeElement instanceof Element) {
+            activeElement = activeElement.shadowRoot.activeElement;
+        }
+
+        return activeElement;
+    }
+
+    /**
+     * 从当前文本选区中推断用户是否正处于可编辑区域。
+     * 富文本编辑器里，键盘事件目标、焦点元素都可能不稳定，
+     * 但选区锚点通常仍然落在评论输入框内部。
+     *
+     * @returns {boolean}
+     */
+    function isEditingFromSelection() {
+        const selection = window.getSelection();
+        if (!selection) {
+            return false;
+        }
+
+        const anchorElement = getClosestTargetElement(selection.anchorNode);
+        const focusElement = getClosestTargetElement(selection.focusNode);
+
+        return isEditableElement(anchorElement) || isEditableElement(focusElement);
+    }
+
+    /**
+     * 从事件传播路径里检查是否命中了可编辑区域。
+     * 某些站点在捕获阶段抛出的 keydown 事件，`target` 可能不是最终的输入节点，
+     * 但 composedPath 里仍然能保留经过的编辑器容器。
+     *
+     * @param {KeyboardEvent} event
+     * @returns {boolean}
+     */
+    function isEditingFromEventPath(event) {
+        if (typeof event.composedPath !== 'function') {
+            return false;
+        }
+
+        const path = event.composedPath();
+        return path.some((pathItem) => {
+            const element = getClosestTargetElement(pathItem);
+            return isEditableElement(element);
+        });
+    }
+
+    /**
+     * 判断当前按键目标是否属于不该拦截的输入区域。
+     * 这里综合检查：
+     * 1. 事件目标
+     * 2. 事件传播路径
+     * 3. 当前焦点元素
+     * 4. 当前文本选区
+     *
+     * 这样能更稳地覆盖评论框、搜索框、富文本编辑器等输入场景。
+     *
+     * @param {KeyboardEvent} event
+     * @returns {boolean}
+     */
+    function shouldIgnoreShortcutTarget(event) {
+        const targetElement = getClosestTargetElement(event.target);
+        const activeElement = getDeepActiveElement();
+
+        if (document.designMode === 'on') {
+            return true;
+        }
+
+        return (
+            isEditableElement(targetElement)
+            || isEditableElement(activeElement)
+            || isEditingFromEventPath(event)
+            || isEditingFromSelection()
+        );
     }
 
     /**
@@ -288,22 +393,25 @@
     }
 
     /**
-     * 执行“真全屏 -> 网页全屏”。
+     * 执行“真全屏 -> 普通模式”。
      *
      * 目标链路现在是：
      * 1. 普通 -> 网页全屏
      * 2. 网页全屏 -> 真全屏
-     * 3. 真全屏 -> 网页全屏
-     * 4. 网页全屏 -> 普通
+     * 3. 真全屏 -> 普通
      *
-     * 因此这里不再把“真全屏退出”强制收口到普通模式，
-     * 而是明确等待它落回网页全屏，并把这个网页全屏标记成“下一步该退普通”的中间态。
+     * 考虑到 B 站不同页面里，退出真全屏后的真实落点可能是：
+     * 1. 直接回到普通模式
+     * 2. 先回到网页全屏
+     *
+     * 为了把最终结果统一成“普通模式”，
+     * 这里会先退出真全屏；如果发现仍停留在网页全屏，再补一次退出网页全屏。
      *
      * @param {HTMLElement} player
      * @param {number} token
      * @returns {Promise<boolean>}
      */
-    async function switchFromFullscreenToWebscreen(player, token) {
+    async function switchFromFullscreenToNormal(player, token) {
         const exitedFullscreen = await clickPlayerButton(player, () => getFullscreenButton(player));
         if (!exitedFullscreen) {
             console.warn('[B站F键切换网页全屏与全屏] 未找到原生全屏按钮，无法退出真全屏');
@@ -328,12 +436,8 @@
         }
 
         /**
-         * 运行时证据表明，B 站当前从真全屏退出后会直接回到普通模式，
-         * 而不是自动落到网页全屏。
-         * 因此这里不再假设“播放器会替我们补回网页全屏”，
-         * 而是先观察退出后的真实落点：
-         * 1. 如果已经是网页全屏，就直接进入“下一步该退普通”的中间态
-         * 2. 如果已经回到普通，就由脚本主动再补一次网页全屏
+         * 真全屏退出后，播放器可能直接回普通，也可能先停在网页全屏。
+         * 这里先等待它稳定落到“非真全屏”的某个中间态，再根据实际状态决定是否继续补一步退出网页全屏。
          */
         const hasReachedIntermediateState = await waitFor(() => {
             if (!isActiveSwitchToken(token, player)) {
@@ -348,43 +452,19 @@
         }
 
         if (!hasReachedIntermediateState) {
-            console.warn('[B站F键切换网页全屏与全屏] 退出真全屏后未能稳定回到网页全屏');
+            console.warn('[B站F键切换网页全屏与全屏] 退出真全屏后未能稳定回到普通模式或网页全屏');
             return false;
         }
 
         if (isNormalScreen(player)) {
-            const reenteredWebscreen = await clickPlayerButton(player, () => getWebscreenButton(player));
-            if (!reenteredWebscreen) {
-                console.warn('[B站F键切换网页全屏与全屏] 退出真全屏后已回到普通模式，但未能重新进入网页全屏');
-                return false;
-            }
-
-            const hasEnteredWebscreen = await waitFor(() => {
-                if (!isActiveSwitchToken(token, player)) {
-                    return true;
-                }
-
-                return isWebscreen(player);
-            }, CONFIG.screenSwitchTimeout);
-
-            if (!isActiveSwitchToken(token, player)) {
-                return false;
-            }
-
-            if (!hasEnteredWebscreen) {
-                console.warn('[B站F键切换网页全屏与全屏] 退出真全屏后尝试补回网页全屏超时');
-                return false;
-            }
+            return true;
         }
 
-        state.webscreenReturnToNormal = true;
-        return isWebscreen(player);
+        return switchFromWebscreenToNormal(player, token);
     }
 
     /**
      * 执行“网页全屏 -> 普通模式”。
-     * 这个分支只在“当前网页全屏是从真全屏退回来的中间态”时使用。
-     *
      * @param {HTMLElement} player
      * @param {number} token
      * @returns {Promise<boolean>}
@@ -412,8 +492,6 @@
             console.warn('[B站F键切换网页全屏与全屏] 退出网页全屏超时，未能回到普通模式');
             return false;
         }
-
-        state.webscreenReturnToNormal = false;
         return isNormalScreen(player);
     }
 
@@ -421,8 +499,7 @@
      * 执行三态循环：
      * 1. 普通 -> 网页全屏
      * 2. 网页全屏 -> 全屏
-     * 3. 全屏 -> 网页全屏
-     * 4. 网页全屏 -> 普通
+     * 3. 全屏 -> 普通
      *
      * 这里始终通过点击 B 站原生按钮来驱动切换，而不是直接调用浏览器全屏 API，
      * 这样更贴近 B 站自身的状态机，也更不容易和播放器内部逻辑打架。
@@ -442,23 +519,17 @@
 
         try {
             if (isFullscreen(player)) {
-                await switchFromFullscreenToWebscreen(player, switchToken);
+                await switchFromFullscreenToNormal(player, switchToken);
                 return;
             }
 
             if (isWebscreen(player)) {
-                if (state.webscreenReturnToNormal) {
-                    await switchFromWebscreenToNormal(player, switchToken);
-                    return;
-                }
-
                 const enteredFullscreen = await clickPlayerButton(player, () => getFullscreenButton(player));
                 if (!enteredFullscreen) {
                     console.warn('[B站F键切换网页全屏与全屏] 未找到原生全屏按钮，无法从网页全屏进入全屏');
                     return;
                 }
 
-                state.webscreenReturnToNormal = false;
                 return;
             }
 
@@ -467,8 +538,6 @@
                 console.warn('[B站F键切换网页全屏与全屏] 未找到原生网页全屏按钮，无法从普通模式进入网页全屏');
                 return;
             }
-
-            state.webscreenReturnToNormal = false;
         } finally {
             if (state.switchToken === switchToken) {
                 state.switchToken += 1;
@@ -509,7 +578,7 @@
                 return;
             }
 
-            if (shouldIgnoreShortcutTarget(event.target)) {
+            if (shouldIgnoreShortcutTarget(event)) {
                 return;
             }
 
@@ -548,7 +617,6 @@
             cleanupTasks.forEach((cleanup) => cleanup());
             state.switching = false;
             state.switchToken += 1;
-            state.webscreenReturnToNormal = false;
         };
     }
 
