@@ -31,10 +31,20 @@
         player: '.bpx-player-container',
         webscreenButton: '.bpx-player-ctrl-web[role="button"][aria-label="网页全屏"]',
         fullscreenButton: '.bpx-player-ctrl-full[role="button"][aria-label="全屏"]',
+        /**
+         * “输入区域”选择器，用于判断按键时是否正在输入。
+         *
+         * 注意这里刻意把 `input` 收窄成“真正的文本输入控件”：
+         * - 排除 checkbox / radio / button / submit / reset / range / color / file / image
+         * - B 站播放器弹幕开关（.bpx-player-dm-switch）内部藏着一个隐藏 checkbox input，
+         *   点击开关后焦点会落到这个 checkbox 上。如果仍按老写法匹配任意 `input`，
+         *   脚本会把“焦点在弹幕开关上”误判成“正在输入”，从而忽略 F 键快捷键，
+         *   表现为“点击弹幕开关后快捷键失效，需要再点击视频才能恢复”。
+         */
         ignoredInputs: [
-            'input',
             'textarea',
             'select',
+            'input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="range"]):not([type="color"]):not([type="file"]):not([type="image"])',
             '[role="textbox"]',
             '[contenteditable]:not([contenteditable="false"])'
         ].join(', ')
