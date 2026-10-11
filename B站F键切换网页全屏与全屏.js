@@ -567,7 +567,10 @@
      */
     function installShortcutListener() {
         const handleKeydown = (event) => {
-            if (event.defaultPrevented) {
+            // 守卫兼容：网页键盘IME守卫脚本会抢先 preventDefault 裸字母键阻止 IME 组词，
+            // 此时 defaultPrevented 为 true 但事件仍应继续处理（守卫不打 stopPropagation）。
+            // 只有"被其他业务/页面监听器处理过"的按键才跳过。
+            if (event.defaultPrevented && !event.__imeGuardHandled) {
                 return;
             }
 
